@@ -202,11 +202,11 @@ const MD_CONTINUED = /^ {2,}\S/;
 
 const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
-function findUnescaped(s, what, from) {
-  const last = s.length - what.length;
+/** The first index from `from` where `s` holds `what` outside a backslash escape, before `end`, or -1. */
+function findUnescaped(s, what, from, end) {
+  const last = end - what.length;
   for (let j = from; j <= last; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (s[j] === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
       j++;
       continue;
     }
@@ -215,16 +215,16 @@ function findUnescaped(s, what, from) {
   return -1;
 }
 
-/** The first single * from `from` (one whose run is not **), outside an escape, or -1. */
-function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
+/** The first single * from `from` (one whose run is not **), outside an escape, before `end`, or -1. */
+function findSingleStar(s, from, end) {
+  for (let j = from; j < end; j++) {
     const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
+    if (c === '\\' && j + 1 < end && ESCAPABLE.has(s[j + 1])) {
       j++;
       continue;
     }
     if (c !== '*') continue;
-    if (s[j + 1] === '*') {
+    if (j + 1 < end && s[j + 1] === '*') {
       j++;
       continue;
     }
@@ -234,19 +234,20 @@ function findSingleStar(s, from) {
 }
 
 /**
- * `s` rendered inline into `out` (an array of pieces); `link(target)` is a link's href.
- * Plain runs are escaped in bulk; only the dialect's specials break a run.
+ * `s[start, end)` rendered inline into `out` (an array of pieces); `link(target)` is a link's
+ * (already escaped) href. Plain runs are escaped in bulk; spans recurse on ranges, never slices,
+ * and every search is bounded by `end` exactly as if the range were its own string.
  */
-function inlineInto(s, link, out) {
-  let i = 0;
-  let runStart = 0;
+function inlineInto(s, start, end, link, out) {
+  let i = start;
+  let runStart = start;
   const flush = (to) => {
     if (to > runStart) out.push(escHtml(s.slice(runStart, to)));
   };
-  while (i < s.length) {
+  while (i < end) {
     const c = s[i];
     if (c === '\\') {
-      if (i + 1 < s.length && ESCAPABLE.has(s[i + 1])) {
+      if (i + 1 < end && ESCAPABLE.has(s[i + 1])) {
         flush(i);
         out.push(escHtml(s[i + 1]));
         i += 2;
@@ -256,7 +257,7 @@ function inlineInto(s, link, out) {
     }
     if (c === '`') {
       const j = s.indexOf('`', i + 1);
-      if (j > i + 1) {
+      if (j !== -1 && j < end && j > i + 1) {
         flush(i);
         out.push('<code>', escHtml(s.slice(i + 1, j)), '</code>');
         i = j + 1;
@@ -265,23 +266,23 @@ function inlineInto(s, link, out) {
       continue;
     }
     if (c === '*') {
-      if (s[i + 1] === '*') {
-        const j = findUnescaped(s, '**', i + 2);
+      if (i + 1 < end && s[i + 1] === '*') {
+        const j = findUnescaped(s, '**', i + 2, end);
         if (j > i + 2) {
           flush(i);
           out.push('<strong>');
-          inlineInto(s.slice(i + 2, j), link, out);
+          inlineInto(s, i + 2, j, link, out);
           out.push('</strong>');
           i = j + 2;
           runStart = i;
         } else i += 2;
         continue;
       }
-      const j = findSingleStar(s, i + 1);
+      const j = findSingleStar(s, i + 1, end);
       if (j > i + 1) {
         flush(i);
         out.push('<em>');
-        inlineInto(s.slice(i + 1, j), link, out);
+        inlineInto(s, i + 1, j, link, out);
         out.push('</em>');
         i = j + 1;
         runStart = i;
@@ -289,13 +290,13 @@ function inlineInto(s, link, out) {
       continue;
     }
     if (c === '[') {
-      const k = findUnescaped(s, ']', i + 1);
-      const m = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
-      const target = m === -1 ? '' : s.slice(k + 2, m);
+      const k = findUnescaped(s, ']', i + 1, end);
+      const m = k !== -1 && k + 1 < end && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
+      const target = m === -1 || m >= end ? '' : s.slice(k + 2, m);
       if (target !== '' && !/\s/.test(target)) {
         flush(i);
-        out.push('<a href="', escHtml(link(target)), '">');
-        inlineInto(s.slice(i + 1, k), link, out);
+        out.push('<a href="', link(target), '">');
+        inlineInto(s, i + 1, k, link, out);
         out.push('</a>');
         i = m + 1;
         runStart = i;
@@ -304,16 +305,16 @@ function inlineInto(s, link, out) {
     }
     i++;
   }
-  flush(s.length);
+  flush(end);
 }
 
 const SPECIALS = /[\\`*[]/;
 
-/** `s` rendered inline, as one string. */
+/** `s` rendered inline, as one string. `link` maps a target to its escaped href. */
 function inline(s, link) {
   if (!SPECIALS.test(s)) return escHtml(s);
   const out = [];
-  inlineInto(s, link, out);
+  inlineInto(s, 0, s.length, link, out);
   return out.join('');
 }
 
@@ -570,9 +571,19 @@ function renderInto(nodes, scope, ctx, out, depth) {
       case 'text':
         out.push(nd.text);
         break;
-      case 'var':
-        out.push(escHtml(textOf(lookup(scope, nd.path))));
+      case 'var': {
+        const v = lookup(scope, nd.path);
+        if (typeof v === 'string') {
+          // The same strings (titles, urls, tag names) are written on page after page.
+          let e = ctx.escCache.get(v);
+          if (e === undefined) {
+            e = escHtml(v);
+            ctx.escCache.set(v, e);
+          }
+          out.push(e);
+        } else out.push(escHtml(textOf(v)));
         break;
+      }
       case 'raw':
         out.push(textOf(lookup(scope, nd.path)));
         break;
@@ -726,7 +737,8 @@ export function run(input) {
     bySource.set(s.path, s);
   }
 
-  // Markdown, links resolved against the built pages and the static files.
+  // Markdown, links resolved against the built pages and the static files. The link function
+  // returns the href already HTML-escaped, ready for the inline renderer to write.
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
   const linkCache = new Map();
@@ -750,9 +762,10 @@ export function run(input) {
         else if (path !== null && staticPaths.has(path)) out = `${base}/${path}${frag}`;
         else {
           broken.add(`broken-link ${s.path} -> ${target}`);
-          return target;
+          return escHtml(target);
         }
       }
+      out = escHtml(out);
       linkCache.set(cacheKey, out);
       return out;
     };
@@ -813,7 +826,8 @@ export function run(input) {
   });
   const cards = new Map(posts.map((p) => [p, cardOf(p)]));
   const pageOf = (s) => ({
-    ...cardOf(s),
+    // A post's card is the one already built for the collections; only a page builds its own.
+    ...(s.post ? cards.get(s) : cardOf(s)),
     slug: s.slug,
     content: s.html,
     toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
@@ -824,12 +838,19 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates };
+  const ctx = { templates, escCache: new Map() };
+  // Every render sees the same site, tags and recent: they sit in one shared base scope, and a
+  // render's own vars chain over it (the reference merges them into the root vars; the vars a
+  // render passes never reuse those three names, and the guard keeps the merge for any that did).
+  const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
   const render = (name, vars) => {
     const nodes = templates.get(name);
     if (nodes === undefined) return null;
     const out = [];
-    renderInto(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, out, 0);
+    const scope = 'site' in vars || 'tags' in vars || 'recent' in vars
+      ? { vars: { site, tags: allTags, recent, ...vars }, parent: null }
+      : { vars, parent: baseScope };
+    renderInto(nodes, scope, ctx, out, 0);
     return out.join('');
   };
   const output = {};
