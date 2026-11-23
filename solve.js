@@ -563,7 +563,7 @@ function truthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
-/** `nodes` rendered into `out` in `scope`; `ctx` holds the parsed templates (a Map) and the include depth. */
+/** `nodes` rendered into `out` in `scope`; `ctx` holds the compiled templates and the include depth. */
 function renderInto(nodes, scope, ctx, out, depth) {
   for (let idx = 0; idx < nodes.length; idx++) {
     const nd = nodes[idx];
@@ -571,19 +571,9 @@ function renderInto(nodes, scope, ctx, out, depth) {
       case 'text':
         out.push(nd.text);
         break;
-      case 'var': {
-        const v = lookup(scope, nd.path);
-        if (typeof v === 'string') {
-          // The same strings (titles, urls, tag names) are written on page after page.
-          let e = ctx.escCache.get(v);
-          if (e === undefined) {
-            e = escHtml(v);
-            ctx.escCache.set(v, e);
-          }
-          out.push(e);
-        } else out.push(escHtml(textOf(v)));
+      case 'var':
+        pushVar(ctx, out, lookup(scope, nd.path));
         break;
-      }
       case 'raw':
         out.push(textOf(lookup(scope, nd.path)));
         break;
@@ -603,13 +593,80 @@ function renderInto(nodes, scope, ctx, out, depth) {
         }
         break;
       }
-      case 'include': {
-        const t = ctx.templates.get(nd.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderInto(t, scope, ctx, out, depth + 1);
+      case 'include':
+        renderInclude(ctx, nd.name, scope, out, depth);
         break;
-      }
     }
   }
+}
+
+/** A {{ }} value written escaped; the same strings (titles, urls, tag names) recur on page after page. */
+function pushVar(ctx, out, v) {
+  if (typeof v === 'string') {
+    let e = ctx.escCache.get(v);
+    if (e === undefined) {
+      e = escHtml(v);
+      ctx.escCache.set(v, e);
+    }
+    out.push(e);
+  } else out.push(escHtml(textOf(v)));
+}
+
+/** An include: the named compiled template rendered in the same scope, at most INCLUDE_DEPTH deep. */
+function renderInclude(ctx, name, scope, out, depth) {
+  const t = ctx.templates.get(name);
+  if (t !== undefined && depth < INCLUDE_DEPTH) t.fn(scope, ctx, out, depth + 1, t.consts);
+}
+
+/**
+ * A template's nodes compiled to a plain function (scope, ctx, out, depth, C) that appends to
+ * out, with its path arrays in C. The generated code holds only JSON-quoted literals, validated
+ * identifiers and the dialect's own operations — the same steps renderInto walks, without the
+ * walk. Helpers reach it through ctx.H because a compiled function sees no module scope.
+ */
+function compileTemplate(nodes) {
+  const consts = [];
+  let uid = 0;
+  const gen = (list, sv) => {
+    let code = '';
+    for (const nd of list) {
+      switch (nd.kind) {
+        case 'text':
+          if (nd.text !== '') code += `out.push(${JSON.stringify(nd.text)});\n`;
+          break;
+        case 'var':
+          consts.push(nd.path);
+          code += `pushVar(ctx, out, lookup(${sv}, C[${consts.length - 1}]));\n`;
+          break;
+        case 'raw':
+          consts.push(nd.path);
+          code += `out.push(textOf(lookup(${sv}, C[${consts.length - 1}])));\n`;
+          break;
+        case 'if': {
+          consts.push(nd.path);
+          const ci = consts.length - 1;
+          code += `if (truthy(lookup(${sv}, C[${ci}])) !== ${nd.not}) {\n${gen(nd.then, sv)}}`;
+          if (nd.else !== null) code += ` else {\n${gen(nd.else, sv)}}`;
+          code += '\n';
+          break;
+        }
+        case 'for': {
+          consts.push(nd.path);
+          const ci = consts.length - 1;
+          const id = uid++;
+          code += `{ const xs$${id} = lookup(${sv}, C[${ci}]); if (Array.isArray(xs$${id})) { const len$${id} = xs$${id}.length; for (let k$${id} = 0; k$${id} < len$${id}; k$${id}++) { const scope$${id} = { vars: { [${JSON.stringify(nd.name)}]: xs$${id}[k$${id}], loop: { index: k$${id} + 1, first: k$${id} === 0, last: k$${id} === len$${id} - 1, length: len$${id} } }, parent: ${sv} };\n${gen(nd.body, `scope$${id}`)}} } }\n`;
+          break;
+        }
+        case 'include':
+          code += `renderInclude(ctx, ${JSON.stringify(nd.name)}, ${sv}, out, depth);\n`;
+          break;
+      }
+    }
+    return code;
+  };
+  const body = `const { lookup, textOf, truthy, pushVar, renderInclude } = ctx.H;\n${gen(nodes, 'scope')}`;
+  const fn = new Function('scope', 'ctx', 'out', 'depth', 'C', body);
+  return { fn, consts };
 }
 
 // ---------------------------------------------------------------- the build
@@ -679,12 +736,23 @@ export function run(input) {
   }
   const base = input.site.base_url.replace(/\/+$/, '');
 
+  // The parsed templates, compiled once for this build; one that fails to compile (none
+  // should — its nodes are already validated) falls back to the node walker.
+  const compiled = new Map();
+  for (const [name, nodes] of templates) {
+    try {
+      compiled.set(name, compileTemplate(nodes));
+    } catch {
+      compiled.set(name, { fn: (scope, ctx, out, depth) => renderInto(nodes, scope, ctx, out, depth), consts: null });
+    }
+  }
+
   // Sources in path order; a .md file is a source, anything else static.
   const files = [...input.files].sort((x, y) => byCodeUnits(x.path, y.path));
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.replace(/\r\n?/g, '\n') });
+    if (f.path.endsWith('.md')) sources.push({ path: f.path, text: f.content.includes('\r') ? f.content.replace(/\r\n?/g, '\n') : f.content });
     else statics.push({ path: f.path, content: f.content });
   }
 
@@ -838,19 +906,19 @@ export function run(input) {
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const ctx = { templates, escCache: new Map() };
+  const ctx = { templates: compiled, escCache: new Map(), H: { lookup, textOf, truthy, pushVar, renderInclude } };
   // Every render sees the same site, tags and recent: they sit in one shared base scope, and a
   // render's own vars chain over it (the reference merges them into the root vars; the vars a
   // render passes never reuse those three names, and the guard keeps the merge for any that did).
   const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
   const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
+    const t = compiled.get(name);
+    if (t === undefined) return null;
     const out = [];
     const scope = 'site' in vars || 'tags' in vars || 'recent' in vars
       ? { vars: { site, tags: allTags, recent, ...vars }, parent: null }
       : { vars, parent: baseScope };
-    renderInto(nodes, scope, ctx, out, 0);
+    t.fn(scope, ctx, out, 0, t.consts);
     return out.join('');
   };
   const output = {};
